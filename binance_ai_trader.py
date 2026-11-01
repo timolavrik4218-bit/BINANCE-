@@ -946,35 +946,51 @@ def ask_claude_to_select_and_trade(market_data, wallet_info, memory):
         "але продовжить супровід відкритих позицій."
     )
 
-    with client_anthropic.messages.stream(
-        model=model_to_use,
-        max_tokens=2000,
-        system=system_instruction,
-        messages=[{"role": "user", "content": prompt}],
-        output_config={
-            "format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
-                        "symbol": {"type": "string"},
-                        "quantity_pct": {"type": "number"},
-                        "take_profit": {"type": "number"},
-                        "stop_loss": {"type": "number"},
-                        "reasoning": {"type": "string"}
-                    },
-                    "required": ["action", "symbol", "quantity_pct", "take_profit", "stop_loss", "reasoning"],
-                    "additionalProperties": False
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with client_anthropic.messages.stream(
+                model=model_to_use,
+                max_tokens=4000,
+                system=system_instruction,
+                messages=[{"role": "user", "content": prompt}],
+                output_config={
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+                                "symbol": {"type": "string"},
+                                "quantity_pct": {"type": "number"},
+                                "take_profit": {"type": "number"},
+                                "stop_loss": {"type": "number"},
+                                "reasoning": {"type": "string"}
+                            },
+                            "required": ["action", "symbol", "quantity_pct", "take_profit", "stop_loss", "reasoning"],
+                            "additionalProperties": False
+                        }
+                    }
                 }
-            }
-        }
-    ) as stream:
-        response_text = "".join(list(stream.text_stream))
-        decision = json.loads(response_text)
-        if not isinstance(decision, dict):
-            raise ValueError("Claude повернув не JSON-об'єкт")
-        return decision
+            ) as stream:
+                response_text = "".join(list(stream.text_stream))
+            decision = json.loads(response_text)
+            if not isinstance(decision, dict):
+                raise ValueError("Claude повернув не JSON-об'єкт")
+            return decision
+        except (ValueError, anthropic.APIError) as e:
+            last_error = e
+            print(f"⚠️ Некоректна відповідь Claude (спроба {attempt}/3): {e}")
+            time.sleep(2)
+
+    return {
+        "action": "HOLD",
+        "symbol": "",
+        "quantity_pct": 0,
+        "take_profit": 0,
+        "stop_loss": 0,
+        "reasoning": f"Claude не повернув коректну відповідь після 3 спроб ({last_error}); безпечне рішення — HOLD.",
+    }
 
 def verify_trade_immediately(symbol, bought_qty, memory, buy_price):
     """Виправлення: Продає ТІЛЬКИ щойно куплену кількість (bought_qty) при скасуванні"""
