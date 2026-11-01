@@ -1470,6 +1470,10 @@ if __name__ == "__main__":
             # 2. Свіжий баланс після можливих продажів і безпечна синхронізація
             wallet_info = get_account_balances_and_positions(memory["active_trades"])
             sync_memory_with_wallet(memory, wallet_info)
+            if wallet_info.get("error"):
+                print("⏳ Дані гаманця недоступні — аналіз Claude пропущено. Повтор через 60 с.")
+                time.sleep(60)
+                continue
             protect_all_positions(memory)
             
             print(f"💵 Вільний баланс: {wallet_info['usdt_free_balance']:.4f} USDT")
