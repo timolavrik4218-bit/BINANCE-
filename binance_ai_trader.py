@@ -1414,9 +1414,22 @@ def start_health_server():
     print(f"🌐 Health-сервер слухає порт {port_value}.")
 
 
+def log_public_ip():
+    # Потрібно, щоб додати вихідну IP-адресу хостингу до білого списку Binance
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            ip = requests.get(url, timeout=10).text.strip()
+            print(f"🌍 Вихідна публічна IP цього бота: {ip} (додайте її в Binance API → trusted IPs)")
+            return
+        except requests.RequestException:
+            continue
+    print("⚠️ Не вдалося визначити публічну IP-адресу.")
+
+
 if __name__ == "__main__":
     print("🤖 Бот запущений з виправленими багами (точний PnL, SL/TP, без втрати пам'яті).")
     start_health_server()
+    log_public_ip()
     
     while True:
         try:
