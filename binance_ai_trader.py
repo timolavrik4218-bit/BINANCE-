@@ -1380,6 +1380,10 @@ def execute_trade_safely(trade_decision, memory):
             if trade and not trade.get("oco"):
                 ensure_oco_safe(memory, symbol, force=True)
 
+DEFAULT_KEEP_ALIVE_URL = "https://binance-jcm1.onrender.com"
+KEEP_ALIVE_INTERVAL_SECONDS = 600
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def _respond(self, send_body):
         body = b"OK"
@@ -1414,6 +1418,24 @@ def start_health_server():
     print(f"🌐 Health-сервер слухає порт {port_value}.")
 
 
+def keep_alive_loop(url):
+    # Render Free засинає після 15 хв без вхідного трафіку; пінг публічного URL цьому запобігає
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+        try:
+            requests.get(url, timeout=20)
+        except requests.RequestException as e:
+            print(f"⚠️ Keep-alive пінг не вдався: {e}")
+
+
+def start_keep_alive():
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("KEEP_ALIVE_URL") or DEFAULT_KEEP_ALIVE_URL
+    if not os.getenv("PORT") or not url:
+        return
+    threading.Thread(target=keep_alive_loop, args=(url,), daemon=True).start()
+    print(f"🔔 Keep-alive пінг кожні {KEEP_ALIVE_INTERVAL_SECONDS // 60} хв: {url}")
+
+
 def log_public_ip():
     # Потрібно, щоб додати вихідну IP-адресу хостингу до білого списку Binance
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
@@ -1429,6 +1451,7 @@ def log_public_ip():
 if __name__ == "__main__":
     print("🤖 Бот запущений з виправленими багами (точний PnL, SL/TP, без втрати пам'яті).")
     start_health_server()
+    start_keep_alive()
     log_public_ip()
     
     while True:
