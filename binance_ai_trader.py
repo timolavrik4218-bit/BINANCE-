@@ -34,8 +34,10 @@ if missing_keys:
 
 # Налаштування
 MIN_BINANCE_NOTIONAL_USDT = 5.5   # Мінімальний ордер Binance (5 USDT) із невеликим запасом
-CHECK_INTERVAL_SECONDS = 60      # Не перевантажуємо Binance частими скануваннями
+CHECK_INTERVAL_SECONDS = 10      # Перевіряємо стан кожні 10 секунд
 TOP_MARKET_COINS_LIMIT = 20       # Скануємо найліквідніші 20 монет
+MARKET_SCAN_INTERVAL_SECONDS = 60
+API_RETRY_SECONDS = 10
 MEMORY_FILE = os.getenv("MEMORY_FILE", "trade_memory.json")
 
 client_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -46,9 +48,11 @@ TIME_RESYNC_SECONDS = 60
 TIME_SAFETY_MARGIN_MS = 300   # тримаємо локальний час трохи "позаду" сервера: Binance відхиляє запити з майбутнього
 _last_time_sync = 0.0
 API_ERROR_THRESHOLD = 10
-API_ERROR_WINDOW_SECONDS = 600
 API_ERROR_COUNTS = {}
+API_ERROR_TOTAL = 0
+API_ERROR_LAST = None
 API_EMERGENCY_TRIGGERED = False
+API_ERROR_LOCK = threading.Lock()
 CURRENT_MEMORY = None
 BINANCE_COOLDOWN_UNTIL = 0.0
 MARKET_TICKER_CACHE = {}
@@ -66,9 +70,17 @@ def _api_error_signature(error):
     return f"binance_transport:{type(error).__name__}"
 
 
-def _record_binance_api_error(error):
-    global API_EMERGENCY_TRIGGERED, BINANCE_COOLDOWN_UNTIL
+def _record_api_error(error, api_name):
+    global API_ERROR_TOTAL, API_ERROR_LAST, API_EMERGENCY_TRIGGERED, BINANCE_COOLDOWN_UNTIL
     now = time.time()
+    signature = f"{api_name}:{_api_error_signature(error) if api_name == 'binance' else type(error).__name__}"
+    with API_ERROR_LOCK:
+        API_ERROR_TOTAL += 1
+        API_ERROR_LAST = signature
+        record = API_ERROR_COUNTS.setdefault(signature, {"count": 0})
+        record["count"] += 1
+        error_count = API_ERROR_TOTAL
+
     if isinstance(error, BinanceAPIException) and error.code == -1003:
         message = str(getattr(error, "message", error))
         match = re.search(r"banned until\s+(\d+)", message, re.IGNORECASE)
@@ -80,31 +92,14 @@ def _record_binance_api_error(error):
         print(
             f"⛔ Binance rate-limit ban (-1003): запити призупинені "
             f"приблизно на {retry_in} с. Аварійний продаж не запускається, "
-            "бо Binance відхиляє всі запити."
+            "поки біржа блокує запити."
         )
-        return
-
-    signature = _api_error_signature(error)
-    record = API_ERROR_COUNTS.get(signature, {"count": 0, "last_at": 0.0})
-    if now - float(record.get("last_at", 0.0)) > API_ERROR_WINDOW_SECONDS:
-        record = {"count": 0, "last_at": 0.0}
-    record["count"] += 1
-    record["last_at"] = now
-    API_ERROR_COUNTS[signature] = record
-
-    if CURRENT_MEMORY is not None:
-        persisted = CURRENT_MEMORY.setdefault("api_error_counts", {})
-        persisted[signature] = dict(record)
-        try:
-            save_memory(CURRENT_MEMORY)
-        except Exception as save_error:
-            print(f"⚠️ Не вдалося зберегти лічильник API-помилок: {save_error}")
 
     print(
-        f"⚠️ Тип API-помилки {signature}: "
-        f"{record['count']}/{API_ERROR_THRESHOLD} за останні 10 хв."
+        f"⚠️ API-помилка {error_count}/{API_ERROR_THRESHOLD} "
+        f"за цей запуск ({signature})."
     )
-    if record["count"] >= API_ERROR_THRESHOLD:
+    if error_count >= API_ERROR_THRESHOLD:
         API_EMERGENCY_TRIGGERED = True
 
 def sync_server_time():
@@ -135,7 +130,7 @@ def _request_with_time_sync(method, uri, signed, *args, **kwargs):
     except (BinanceAPIException, BinanceRequestException, requests.RequestException) as e:
         if isinstance(e, BinanceAPIException) and e.code == -1021:
             sync_server_time()  # наступний запит піде з виправленим часом
-        _record_binance_api_error(e)
+        _record_api_error(e, "binance")
         raise
 
 binance_client._request = _request_with_time_sync
@@ -256,6 +251,8 @@ def load_memory():
             )
         return memory
     except Exception as e:
+        if isinstance(e, requests.RequestException):
+            _record_api_error(e, "supabase")
         raise RuntimeError(f"Не вдалося безпечно завантажити пам'ять угод: {e}") from e
 
 def save_memory(memory):
@@ -263,6 +260,8 @@ def save_memory(memory):
     try:
         _write_raw_memory(memory)
     except Exception as e:
+        if isinstance(e, requests.RequestException):
+            _record_api_error(e, "supabase")
         raise RuntimeError(f"Не вдалося зберегти пам'ять угод: {e}") from e
 
 def place_order_with_intent(memory, side, symbol, **order_params):
@@ -627,6 +626,8 @@ def get_best_available_model():
             _cached_model = model_ids[0]
             return _cached_model
     except Exception as e:
+        if isinstance(e, anthropic.APIError):
+            _record_api_error(e, "anthropic")
         print(f"⚠️ Помилка вибору моделі: {e}")
     return "claude-haiku-5-5"
 
@@ -1065,6 +1066,8 @@ def ask_claude_to_select_and_trade(market_data, wallet_info, memory):
             return decision
         except (ValueError, anthropic.APIError) as e:
             last_error = e
+            if isinstance(e, anthropic.APIError):
+                _record_api_error(e, "anthropic")
             print(f"⚠️ Некоректна відповідь Claude (спроба {attempt}/3): {e}")
             time.sleep(2)
 
@@ -1098,11 +1101,15 @@ def verify_trade_immediately(symbol, bought_qty, memory, buy_price):
         """
 
         model_to_use = get_best_available_model()
-        response = client_anthropic.messages.create(
-            model=model_to_use,
-            max_tokens=300,
-            messages=[{"role": "user", "content": check_prompt}]
-        )
+        try:
+            response = client_anthropic.messages.create(
+                model=model_to_use,
+                max_tokens=300,
+                messages=[{"role": "user", "content": check_prompt}]
+            )
+        except anthropic.APIError as e:
+            _record_api_error(e, "anthropic")
+            raise
 
         raw_text = ""
         for block in response.content:
@@ -1485,18 +1492,6 @@ def execute_trade_safely(trade_decision, memory):
 def set_current_memory(memory):
     global CURRENT_MEMORY, API_EMERGENCY_TRIGGERED
     CURRENT_MEMORY = memory
-    now = time.time()
-    for signature, record in list(API_ERROR_COUNTS.items()):
-        if now - float(record.get("last_at", 0.0)) > API_ERROR_WINDOW_SECONDS:
-            API_ERROR_COUNTS.pop(signature, None)
-    persisted = memory.get("api_error_counts", {})
-    for signature, record in persisted.items():
-        if now - float(record.get("last_at", 0.0)) <= API_ERROR_WINDOW_SECONDS:
-            current = API_ERROR_COUNTS.get(signature, {"count": 0, "last_at": 0.0})
-            if int(record.get("count", 0)) > int(current.get("count", 0)):
-                API_ERROR_COUNTS[signature] = dict(record)
-            if int(record.get("count", 0)) >= API_ERROR_THRESHOLD:
-                API_EMERGENCY_TRIGGERED = True
     if memory.get("emergency_stop"):
         API_EMERGENCY_TRIGGERED = True
 
@@ -1695,28 +1690,18 @@ def process_emergency_stop(memory):
     set_current_memory(memory)
     stop = memory.get("emergency_stop")
     if not stop:
-        triggered = [
-            (signature, record)
-            for signature, record in API_ERROR_COUNTS.items()
-            if int(record.get("count", 0)) >= API_ERROR_THRESHOLD
-        ]
-        if not triggered and not API_EMERGENCY_TRIGGERED:
+        if API_ERROR_TOTAL < API_ERROR_THRESHOLD and not API_EMERGENCY_TRIGGERED:
             return False
-        if triggered:
-            signature, record = max(triggered, key=lambda item: int(item[1].get("count", 0)))
-            error_count = int(record.get("count", 0))
-        else:
-            signature = "repeated_binance_api_error"
-            error_count = API_ERROR_THRESHOLD
+        signature = API_ERROR_LAST or "api_errors_this_run"
         stop = {
             "status": "liquidating",
             "reason": (
-                f"10 однакових помилок Binance API ({signature}) "
-                "за 10 хвилин"
+                f"Накопичено {API_ERROR_TOTAL} помилок API за цей запуск "
+                f"(останній тип: {signature})"
             ),
             "error_signature": signature,
             "triggered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "error_count": error_count,
+            "error_count": API_ERROR_TOTAL,
             "attempts": 0,
         }
         memory["emergency_stop"] = stop
@@ -1756,6 +1741,7 @@ def publish_admin_snapshot(memory=None, wallet=None, status=None):
             for symbol, trade in memory.get("active_trades", {}).items()
         },
         "total_pnl_usdt": memory.get("total_pnl_usdt", 0.0),
+        "api_errors_this_run": API_ERROR_TOTAL,
         "trade_history": memory.get("trade_history", [])[-30:],
         "emergency_stop": dict(memory["emergency_stop"])
         if memory.get("emergency_stop") else None,
@@ -1834,18 +1820,22 @@ def admin_advisor(message, history):
         if turn.get("role") in {"user", "assistant"}
     )
     messages.append({"role": "user", "content": message})
-    response = client_anthropic.messages.create(
-        model=get_best_available_model(),
-        max_tokens=1200,
-        system=(
-            "Ти — аналітичний помічник адміністратора криптотрейдинг-бота. "
-            "Відповідай на запит і розглядай повідомлення адміністратора як ідеї для аналізу, "
-            "а не як команду до виконання. Ти не маєш доступу до інструментів і не можеш "
-            "виконувати, ініціювати чи обіцяти угоди, змінювати налаштування або стан бота. "
-            "Не проси API-ключі, паролі чи коди автентифікатора. Вказуй невизначеність і ризики."
-        ),
-        messages=messages,
-    )
+    try:
+        response = client_anthropic.messages.create(
+            model=get_best_available_model(),
+            max_tokens=1200,
+            system=(
+                "Ти — аналітичний помічник адміністратора криптотрейдинг-бота. "
+                "Відповідай на запит і розглядай повідомлення адміністратора як ідеї для аналізу, "
+                "а не як команду до виконання. Ти не маєш доступу до інструментів і не можеш "
+                "виконувати, ініціювати чи обіцяти угоди, змінювати налаштування або стан бота. "
+                "Не проси API-ключі, паролі чи коди автентифікатора. Вказуй невизначеність і ризики."
+            ),
+            messages=messages,
+        )
+    except anthropic.APIError as e:
+        _record_api_error(e, "anthropic")
+        raise
     return "\n".join(
         block.text for block in response.content
         if getattr(block, "type", None) == "text"
@@ -1909,6 +1899,7 @@ if __name__ == "__main__":
     start_health_server()
     start_keep_alive()
     log_public_ip()
+    last_market_scan_at = 0.0
     
     while True:
         try:
@@ -1925,10 +1916,10 @@ if __name__ == "__main__":
             if time.time() < BINANCE_COOLDOWN_UNTIL:
                 retry_in = max(1, int(BINANCE_COOLDOWN_UNTIL - time.time()))
                 print(f"⏸️ Binance заблокував IP; без нових API-запитів ще приблизно {retry_in} с.")
-                time.sleep(min(60, retry_in))
+                time.sleep(min(API_RETRY_SECONDS, retry_in))
                 continue
             if process_emergency_stop(memory):
-                time.sleep(60)
+                time.sleep(API_RETRY_SECONDS)
                 continue
             update_performance_goal(memory)
             
@@ -1936,14 +1927,14 @@ if __name__ == "__main__":
             reconcile_oco_orders(memory)
             process_admin_actions(memory)
             if process_emergency_stop(memory):
-                time.sleep(60)
+                time.sleep(API_RETRY_SECONDS)
                 continue
 
             # 1. Опитувальна перевірка SL/TP для позицій без OCO
             check_auto_sl_tp(memory)
             process_admin_actions(memory)
             if process_emergency_stop(memory):
-                time.sleep(60)
+                time.sleep(API_RETRY_SECONDS)
                 continue
             
             # 2. Свіжий баланс після можливих продажів і безпечна синхронізація
@@ -1952,11 +1943,11 @@ if __name__ == "__main__":
             publish_admin_snapshot(memory, wallet_info)
             process_admin_actions(memory)
             if process_emergency_stop(memory):
-                time.sleep(60)
+                time.sleep(API_RETRY_SECONDS)
                 continue
             if wallet_info.get("error"):
-                print("⏳ Дані гаманця недоступні — аналіз Claude пропущено. Повтор через 60 с.")
-                time.sleep(60)
+                print(f"⏳ Дані гаманця недоступні — аналіз Claude пропущено. Повтор через {API_RETRY_SECONDS} с.")
+                time.sleep(API_RETRY_SECONDS)
                 continue
             protect_all_positions(memory)
             
@@ -1973,7 +1964,7 @@ if __name__ == "__main__":
             goal = memory.get("performance_goal", {})
             if goal.get("status") == "paused" and not memory["active_trades"]:
                 print("⏸️ Цільове вікно закрите; позицій для супроводу немає. Бот переходить у режим очікування.")
-                for _ in range(20):
+                for _ in range(max(1, CHECK_INTERVAL_SECONDS // SL_TP_POLL_SECONDS)):
                     time.sleep(SL_TP_POLL_SECONDS)
                     process_admin_actions(memory)
                     if process_emergency_stop(memory):
@@ -1985,24 +1976,28 @@ if __name__ == "__main__":
                 if memory.get("admin_paused"):
                     print("⏸️ Адміністратор призупинив нові угоди; супровід позицій триває.")
                 else:
-                    watchlist = get_top_usdt_symbols(limit=TOP_MARKET_COINS_LIMIT)
-                    market_data = scan_market_watchlist(watchlist)
-                    process_admin_actions(memory)
-                    if process_emergency_stop(memory):
-                        time.sleep(60)
-                        continue
-
-                    if not memory.get("admin_paused") and market_data:
-                        trade_decision = ask_claude_to_select_and_trade(market_data, wallet_info, memory)
+                    if time.time() - last_market_scan_at >= MARKET_SCAN_INTERVAL_SECONDS:
+                        last_market_scan_at = time.time()
+                        watchlist = get_top_usdt_symbols(limit=TOP_MARKET_COINS_LIMIT)
+                        market_data = scan_market_watchlist(watchlist)
                         process_admin_actions(memory)
                         if process_emergency_stop(memory):
-                            time.sleep(60)
+                            time.sleep(API_RETRY_SECONDS)
                             continue
-                        if not memory.get("admin_paused"):
-                            execute_trade_safely(trade_decision, memory)
+
+                        if not memory.get("admin_paused") and market_data:
+                            trade_decision = ask_claude_to_select_and_trade(market_data, wallet_info, memory)
+                            process_admin_actions(memory)
                             if process_emergency_stop(memory):
-                                time.sleep(60)
+                                time.sleep(API_RETRY_SECONDS)
                                 continue
+                            if not memory.get("admin_paused"):
+                                execute_trade_safely(trade_decision, memory)
+                                if process_emergency_stop(memory):
+                                    time.sleep(API_RETRY_SECONDS)
+                                    continue
+                    else:
+                        print("⏳ Повне сканування ринку відкладено, щоб не перевищити ліміт Binance.")
             else:
                 print("⏸️ Новий аналіз і BUY призупинені; перевіряю лише наявні позиції.")
             
@@ -2023,5 +2018,16 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"❌ Помилка в циклі: {e}")
-            print("⏳ Повторна спроба через 60 секунд...")
-            time.sleep(60)
+            if API_ERROR_TOTAL >= API_ERROR_THRESHOLD:
+                emergency_memory = CURRENT_MEMORY or {
+                    "active_trades": {},
+                    "trade_history": [],
+                    "total_pnl_usdt": 0.0,
+                }
+                set_current_memory(emergency_memory)
+                try:
+                    process_emergency_stop(emergency_memory)
+                except Exception as emergency_error:
+                    print(f"❌ Не вдалося обробити аварійну зупинку: {emergency_error}")
+            print(f"⏳ Повторна спроба через {API_RETRY_SECONDS} секунд...")
+            time.sleep(API_RETRY_SECONDS)

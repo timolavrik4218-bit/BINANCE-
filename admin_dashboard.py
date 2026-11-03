@@ -77,6 +77,7 @@ DASHBOARD_TEMPLATE = """
       <p>Вільний USDT: <strong>{{ state.wallet.usdt_free_balance }} USDT</strong></p>
       <p>Зафіксований PnL: <strong>{{ state.total_pnl_usdt }} USDT</strong></p>
       <p>Позицій у пам'яті: <strong>{{ state.active_trades|length }}</strong></p>
+      <p>API-помилки цього запуску: <strong>{{ state.api_errors_this_run }}/10</strong></p>
     </section>
     <section class="card"><h2>Керування</h2>
       <form class="inline" method="post" action="{{ url_for('control') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="pause"><button class="neutral">Пауза торгівлі</button></form>
