@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_DOWN
 import anthropic
 import requests
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,6 +44,44 @@ binance_client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 TIME_RESYNC_SECONDS = 60
 TIME_SAFETY_MARGIN_MS = 300   # тримаємо локальний час трохи "позаду" сервера: Binance відхиляє запити з майбутнього
 _last_time_sync = 0.0
+API_ERROR_THRESHOLD = 10
+API_ERROR_WINDOW_SECONDS = 600
+API_ERROR_COUNTS = {}
+API_EMERGENCY_TRIGGERED = False
+CURRENT_MEMORY = None
+
+
+def _api_error_signature(error):
+    if isinstance(error, BinanceAPIException):
+        return f"binance_api:{error.code}"
+    return f"binance_transport:{type(error).__name__}"
+
+
+def _record_binance_api_error(error):
+    global API_EMERGENCY_TRIGGERED
+    now = time.time()
+    signature = _api_error_signature(error)
+    record = API_ERROR_COUNTS.get(signature, {"count": 0, "last_at": 0.0})
+    if now - float(record.get("last_at", 0.0)) > API_ERROR_WINDOW_SECONDS:
+        record = {"count": 0, "last_at": 0.0}
+    record["count"] += 1
+    record["last_at"] = now
+    API_ERROR_COUNTS[signature] = record
+
+    if CURRENT_MEMORY is not None:
+        persisted = CURRENT_MEMORY.setdefault("api_error_counts", {})
+        persisted[signature] = dict(record)
+        try:
+            save_memory(CURRENT_MEMORY)
+        except Exception as save_error:
+            print(f"⚠️ Не вдалося зберегти лічильник API-помилок: {save_error}")
+
+    print(
+        f"⚠️ Тип API-помилки {signature}: "
+        f"{record['count']}/{API_ERROR_THRESHOLD} за останні 10 хв."
+    )
+    if record["count"] >= API_ERROR_THRESHOLD:
+        API_EMERGENCY_TRIGGERED = True
 
 def sync_server_time():
     global _last_time_sync
@@ -64,9 +102,10 @@ def _request_with_time_sync(method, uri, signed, *args, **kwargs):
         sync_server_time()
     try:
         return _original_request(method, uri, signed, *args, **kwargs)
-    except BinanceAPIException as e:
-        if e.code == -1021:
+    except (BinanceAPIException, BinanceRequestException, requests.RequestException) as e:
+        if isinstance(e, BinanceAPIException) and e.code == -1021:
             sync_server_time()  # наступний запит піде з виправленим часом
+        _record_binance_api_error(e)
         raise
 
 binance_client._request = _request_with_time_sync
@@ -175,7 +214,7 @@ def load_memory():
         memory.setdefault("total_pnl_usdt", 0.0)
         if not isinstance(memory["active_trades"], dict) or not isinstance(memory["trade_history"], list):
             raise ValueError("неправильна структура active_trades або trade_history")
-        if memory.get("pending_order"):
+        if memory.get("pending_order") and not memory.get("emergency_stop"):
             pending = memory["pending_order"]
             raise RuntimeError(
                 "Знайдено незавершений ордер "
@@ -1396,6 +1435,256 @@ def execute_trade_safely(trade_decision, memory):
             if trade and not trade.get("oco"):
                 ensure_oco_safe(memory, symbol, force=True)
 
+
+def set_current_memory(memory):
+    global CURRENT_MEMORY, API_EMERGENCY_TRIGGERED
+    CURRENT_MEMORY = memory
+    now = time.time()
+    for signature, record in list(API_ERROR_COUNTS.items()):
+        if now - float(record.get("last_at", 0.0)) > API_ERROR_WINDOW_SECONDS:
+            API_ERROR_COUNTS.pop(signature, None)
+    persisted = memory.get("api_error_counts", {})
+    for signature, record in persisted.items():
+        if now - float(record.get("last_at", 0.0)) <= API_ERROR_WINDOW_SECONDS:
+            current = API_ERROR_COUNTS.get(signature, {"count": 0, "last_at": 0.0})
+            if int(record.get("count", 0)) > int(current.get("count", 0)):
+                API_ERROR_COUNTS[signature] = dict(record)
+            if int(record.get("count", 0)) >= API_ERROR_THRESHOLD:
+                API_EMERGENCY_TRIGGERED = True
+    if memory.get("emergency_stop"):
+        API_EMERGENCY_TRIGGERED = True
+
+
+def save_emergency_state(memory):
+    try:
+        save_memory(memory)
+    except Exception as e:
+        print(f"❌ Не вдалося зберегти стан аварійної зупинки: {e}")
+
+
+def emergency_liquidate_all(memory):
+    """Cancel orders and market-sell all sellable non-USDT spot balances."""
+    global API_EMERGENCY_TRIGGERED
+    stop = memory["emergency_stop"]
+    stop["attempts"] = int(stop.get("attempts", 0)) + 1
+    stop["last_attempt_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    stop["status"] = "liquidating"
+    retryable_failure = False
+    unsold = []
+    print(
+        f"🚨 АВАРІЙНА ЛІКВІДАЦІЯ, спроба {stop['attempts']}: "
+        f"{stop['reason']}"
+    )
+
+    try:
+        open_orders = binance_client.get_open_orders()
+        symbols_to_cancel = {order["symbol"] for order in open_orders}
+    except Exception as e:
+        print(f"❌ Не вдалося отримати відкриті ордери для скасування: {e}")
+        symbols_to_cancel = set()
+        retryable_failure = True
+    symbols_to_cancel.update(
+        symbol for symbol, trade in memory.get("active_trades", {}).items()
+        if trade.get("oco")
+    )
+    for symbol in sorted(symbols_to_cancel):
+        try:
+            binance_client.cancel_all_open_orders(symbol=symbol)
+            trade = memory.get("active_trades", {}).get(symbol)
+            if trade:
+                trade.pop("oco", None)
+            save_emergency_state(memory)
+        except Exception as e:
+            print(f"⚠️ Не вдалося скасувати ордери {symbol}: {e}")
+            retryable_failure = True
+
+    try:
+        exchange_info = binance_client.get_exchange_info()
+        account = binance_client.get_account()
+    except Exception as e:
+        stop["last_error"] = str(e)
+        stop["status"] = "liquidating"
+        print(f"❌ Не вдалося отримати дані Binance для аварійного продажу: {e}")
+        save_emergency_state(memory)
+        return
+
+    usdt_pairs = {}
+    for info in exchange_info.get("symbols", []):
+        if info.get("quoteAsset") != "USDT" or info.get("status") != "TRADING":
+            continue
+        filters = {item.get("filterType"): item for item in info.get("filters", [])}
+        lot_filter = filters.get("MARKET_LOT_SIZE", {})
+        if float(lot_filter.get("stepSize", 0) or 0) <= 0:
+            lot_filter = filters.get("LOT_SIZE", {})
+        notional_filter = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+        usdt_pairs[info["baseAsset"]] = {
+            "symbol": info["symbol"],
+            "step": float(lot_filter.get("stepSize", 0) or 0),
+            "min_qty": float(lot_filter.get("minQty", 0) or 0),
+            "max_qty": float(lot_filter.get("maxQty", 0) or 0),
+            "min_notional": float(notional_filter.get("minNotional", 0) or 0),
+        }
+
+    for balance in account.get("balances", []):
+        asset = balance["asset"]
+        if asset == "USDT":
+            continue
+        free_qty = float(balance["free"])
+        locked_qty = float(balance["locked"])
+        total_qty = free_qty + locked_qty
+        if total_qty <= 0:
+            continue
+        pair = usdt_pairs.get(asset)
+        if not pair:
+            unsold.append(f"{asset}: немає активної USDT-пари")
+            continue
+        if free_qty <= 0:
+            unsold.append(f"{asset}: кошти заблоковані ордерами")
+            continue
+        try:
+            price = float(binance_client.get_ticker(symbol=pair["symbol"])["lastPrice"])
+            quantity = round_step_size(free_qty, pair["step"])
+            if pair["max_qty"] > 0:
+                quantity = min(quantity, pair["max_qty"])
+                quantity = round_step_size(quantity, pair["step"])
+            min_notional = pair["min_notional"]
+            if quantity < pair["min_qty"] or quantity <= 0 or quantity * price < min_notional:
+                unsold.append(f"{asset}: баланс нижче мінімуму ордера")
+                continue
+            order = binance_client.order_market_sell(
+                symbol=pair["symbol"],
+                quantity=plain_number(quantity),
+                newClientOrderId=f"emg{uuid.uuid4().hex[:30]}",
+            )
+            avg_price, executed_qty, commission, base_fee_qty = calculate_executed_fill_details(order)
+            trade = memory.get("active_trades", {}).get(pair["symbol"])
+            if trade and executed_qty > 0:
+                tracked_qty = float(trade.get("qty", 0.0))
+                attributed_qty = min(tracked_qty, executed_qty)
+                buy_price = float(trade.get("buy_price", avg_price))
+                attributed_commission = commission * attributed_qty / executed_qty
+                pnl = (avg_price - buy_price) * attributed_qty - attributed_commission
+                memory["total_pnl_usdt"] = float(memory.get("total_pnl_usdt", 0.0)) + pnl
+                memory.setdefault("trade_history", []).append({
+                    "symbol": pair["symbol"],
+                    "buy_price": buy_price,
+                    "sell_price": avg_price,
+                    "qty": attributed_qty,
+                    "pnl_usdt": round(pnl, 2),
+                    "reason": "Emergency liquidation",
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                remaining = max(0.0, tracked_qty - executed_qty - base_fee_qty)
+                if remaining > 0:
+                    trade["qty"] = remaining
+                    trade["amount_usdt"] = round(remaining * buy_price, 2)
+                else:
+                    memory["active_trades"].pop(pair["symbol"], None)
+            print(
+                f"🚨 Продано {executed_qty:g} {asset} за {avg_price:g} USDT "
+                f"(комісія {commission:g} USDT)."
+            )
+            stop.setdefault("sold_assets", {})[asset] = (
+                float(stop.setdefault("sold_assets", {}).get(asset, 0.0)) + executed_qty
+            )
+            save_emergency_state(memory)
+        except Exception as e:
+            print(f"❌ Аварійний продаж {asset} не вдався: {e}")
+            stop["last_error"] = str(e)
+            retryable_failure = True
+
+    try:
+        final_account = binance_client.get_account()
+    except Exception as e:
+        stop["last_error"] = str(e)
+        retryable_failure = True
+        final_account = None
+
+    if final_account is not None:
+        final_balances = {
+            item["asset"]: float(item["free"]) + float(item["locked"])
+            for item in final_account.get("balances", [])
+        }
+        for symbol, trade in list(memory.get("active_trades", {}).items()):
+            asset = symbol[:-4] if symbol.endswith("USDT") else symbol
+            actual_qty = final_balances.get(asset, 0.0)
+            if actual_qty <= 0:
+                memory["active_trades"].pop(symbol, None)
+            else:
+                trade["qty"] = min(float(trade.get("qty", actual_qty)), actual_qty)
+        for asset, quantity in final_balances.items():
+            if asset == "USDT" or quantity <= 0:
+                continue
+            pair = usdt_pairs.get(asset)
+            if not pair:
+                continue
+            try:
+                price = float(binance_client.get_ticker(symbol=pair["symbol"])["lastPrice"])
+            except Exception:
+                retryable_failure = True
+                continue
+            if quantity * price < pair["min_notional"] or quantity < pair["min_qty"]:
+                unsold.append(f"{asset}: залишок нижче мінімуму ордера")
+            elif not any(item.startswith(f"{asset}:") for item in unsold):
+                retryable_failure = True
+
+    stop["unsold_assets"] = sorted(set(unsold))
+    if retryable_failure:
+        stop["status"] = "liquidating"
+        print("⏳ Аварійна ліквідація не завершена; повтор через 60 секунд.")
+    elif unsold:
+        stop["status"] = "blocked"
+        print("⛔ Є активи, які Binance не дозволяє продати автоматично:")
+        for item in stop["unsold_assets"]:
+            print(f"   • {item}")
+    else:
+        stop["status"] = "completed"
+        print("🛑 Аварійна ліквідація завершена. Звичайну торгівлю вимкнено.")
+    save_emergency_state(memory)
+    API_EMERGENCY_TRIGGERED = True
+
+
+def process_emergency_stop(memory):
+    global API_EMERGENCY_TRIGGERED
+    set_current_memory(memory)
+    stop = memory.get("emergency_stop")
+    if not stop:
+        triggered = [
+            (signature, record)
+            for signature, record in API_ERROR_COUNTS.items()
+            if int(record.get("count", 0)) >= API_ERROR_THRESHOLD
+        ]
+        if not triggered and not API_EMERGENCY_TRIGGERED:
+            return False
+        if triggered:
+            signature, record = max(triggered, key=lambda item: int(item[1].get("count", 0)))
+            error_count = int(record.get("count", 0))
+        else:
+            signature = "repeated_binance_api_error"
+            error_count = API_ERROR_THRESHOLD
+        stop = {
+            "status": "liquidating",
+            "reason": (
+                f"10 однакових помилок Binance API ({signature}) "
+                "за 10 хвилин"
+            ),
+            "error_signature": signature,
+            "triggered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "error_count": error_count,
+            "attempts": 0,
+        }
+        memory["emergency_stop"] = stop
+        print(f"🚨 {stop['reason']}; нові угоди вимкнено.")
+        save_emergency_state(memory)
+        API_EMERGENCY_TRIGGERED = True
+
+    if stop.get("status") not in {"completed", "blocked"}:
+        emergency_liquidate_all(memory)
+    else:
+        print(f"🛑 Аварійна зупинка активна (стан: {stop['status']}); нові угоди вимкнено.")
+    return True
+
+
 DEFAULT_KEEP_ALIVE_URL = "https://binance-jcm1.onrender.com"
 KEEP_ALIVE_INTERVAL_SECONDS = 600
 
@@ -1474,18 +1763,35 @@ if __name__ == "__main__":
         try:
             print(f"\n--- Новий цикл перевірки ринку [{time.strftime('%Y-%m-%d %H:%M:%S')}] ---")
             
-            memory = load_memory()
+            memory = (
+                CURRENT_MEMORY
+                if API_EMERGENCY_TRIGGERED and CURRENT_MEMORY is not None
+                else load_memory()
+            )
+            set_current_memory(memory)
+            if process_emergency_stop(memory):
+                time.sleep(60)
+                continue
             update_performance_goal(memory)
             
             # 0. Фіксація OCO, що спрацювали на біржі
             reconcile_oco_orders(memory)
+            if process_emergency_stop(memory):
+                time.sleep(60)
+                continue
 
             # 1. Опитувальна перевірка SL/TP для позицій без OCO
             check_auto_sl_tp(memory)
+            if process_emergency_stop(memory):
+                time.sleep(60)
+                continue
             
             # 2. Свіжий баланс після можливих продажів і безпечна синхронізація
             wallet_info = get_account_balances_and_positions(memory["active_trades"])
             sync_memory_with_wallet(memory, wallet_info)
+            if process_emergency_stop(memory):
+                time.sleep(60)
+                continue
             if wallet_info.get("error"):
                 print("⏳ Дані гаманця недоступні — аналіз Claude пропущено. Повтор через 60 с.")
                 time.sleep(60)
@@ -1511,10 +1817,19 @@ if __name__ == "__main__":
             if goal.get("status") != "paused":
                 watchlist = get_top_usdt_symbols(limit=TOP_MARKET_COINS_LIMIT)
                 market_data = scan_market_watchlist(watchlist)
+                if process_emergency_stop(memory):
+                    time.sleep(60)
+                    continue
                 
                 if market_data:
                     trade_decision = ask_claude_to_select_and_trade(market_data, wallet_info, memory)
+                    if process_emergency_stop(memory):
+                        time.sleep(60)
+                        continue
                     execute_trade_safely(trade_decision, memory)
+                    if process_emergency_stop(memory):
+                        time.sleep(60)
+                        continue
             else:
                 print("⏸️ Новий аналіз і BUY призупинені; перевіряю лише наявні позиції.")
             
@@ -1525,6 +1840,8 @@ if __name__ == "__main__":
                 waited += SL_TP_POLL_SECONDS
                 reconcile_oco_orders(memory)
                 check_auto_sl_tp(memory)
+                if process_emergency_stop(memory):
+                    break
             
         except KeyboardInterrupt:
             print("\n🛑 Роботу бота зупинено користувачем.")
