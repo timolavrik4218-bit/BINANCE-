@@ -31,7 +31,7 @@ LOGIN_TEMPLATE = """
   <h1>Панель адміністратора</h1>
   <p class="muted">Увійдіть за логіном, паролем і кодом із Google Authenticator.</p>
   {% for message in get_flashed_messages() %}<p class="message">{{ message }}</p>{% endfor %}
-  <form method="post" action="{{ url_for('login') }}">
+  <form method="post" action="{{ url_for('login_post') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>Логін<input name="username" autocomplete="username" required maxlength="128"></label>
     <label>Пароль<input name="password" type="password" autocomplete="current-password" required maxlength="256"></label>
