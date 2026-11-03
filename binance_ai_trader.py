@@ -2,6 +2,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -33,12 +34,12 @@ if missing_keys:
 
 # Налаштування
 MIN_BINANCE_NOTIONAL_USDT = 5.5   # Мінімальний ордер Binance (5 USDT) із невеликим запасом
-CHECK_INTERVAL_SECONDS = 15      # Сканувати кожні 15 секунд
-TOP_MARKET_COINS_LIMIT = 50       # Скануємо 50 найактивніших монет
+CHECK_INTERVAL_SECONDS = 60      # Не перевантажуємо Binance частими скануваннями
+TOP_MARKET_COINS_LIMIT = 20       # Скануємо найліквідніші 20 монет
 MEMORY_FILE = os.getenv("MEMORY_FILE", "trade_memory.json")
 
 client_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-binance_client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+binance_client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, ping=False)
 
 # Синхронізація часу з сервером Binance (повторюється автоматично, бо годинник ПК дрейфує)
 TIME_RESYNC_SECONDS = 60
@@ -49,6 +50,14 @@ API_ERROR_WINDOW_SECONDS = 600
 API_ERROR_COUNTS = {}
 API_EMERGENCY_TRIGGERED = False
 CURRENT_MEMORY = None
+BINANCE_COOLDOWN_UNTIL = 0.0
+MARKET_TICKER_CACHE = {}
+OCO_RECONCILE_INTERVAL_SECONDS = 30
+_last_oco_reconcile = 0.0
+
+
+class BinanceCooldownError(RuntimeError):
+    pass
 
 
 def _api_error_signature(error):
@@ -58,8 +67,23 @@ def _api_error_signature(error):
 
 
 def _record_binance_api_error(error):
-    global API_EMERGENCY_TRIGGERED
+    global API_EMERGENCY_TRIGGERED, BINANCE_COOLDOWN_UNTIL
     now = time.time()
+    if isinstance(error, BinanceAPIException) and error.code == -1003:
+        message = str(getattr(error, "message", error))
+        match = re.search(r"banned until\s+(\d+)", message, re.IGNORECASE)
+        if match:
+            BINANCE_COOLDOWN_UNTIL = max(BINANCE_COOLDOWN_UNTIL, int(match.group(1)) / 1000)
+        else:
+            BINANCE_COOLDOWN_UNTIL = max(BINANCE_COOLDOWN_UNTIL, now + 300)
+        retry_in = max(0, int(BINANCE_COOLDOWN_UNTIL - now))
+        print(
+            f"⛔ Binance rate-limit ban (-1003): запити призупинені "
+            f"приблизно на {retry_in} с. Аварійний продаж не запускається, "
+            "бо Binance відхиляє всі запити."
+        )
+        return
+
     signature = _api_error_signature(error)
     record = API_ERROR_COUNTS.get(signature, {"count": 0, "last_at": 0.0})
     if now - float(record.get("last_at", 0.0)) > API_ERROR_WINDOW_SECONDS:
@@ -98,18 +122,23 @@ def sync_server_time():
 _original_request = binance_client._request
 
 def _request_with_time_sync(method, uri, signed, *args, **kwargs):
+    if time.time() < BINANCE_COOLDOWN_UNTIL:
+        retry_in = int(BINANCE_COOLDOWN_UNTIL - time.time())
+        raise BinanceCooldownError(f"Binance тимчасово заблокував запити; повтор приблизно через {retry_in} с.")
     if signed and time.time() - _last_time_sync > TIME_RESYNC_SECONDS:
         sync_server_time()
+        if time.time() < BINANCE_COOLDOWN_UNTIL:
+            retry_in = int(BINANCE_COOLDOWN_UNTIL - time.time())
+            raise BinanceCooldownError(f"Binance тимчасово заблокував запити; повтор приблизно через {retry_in} с.")
     try:
         return _original_request(method, uri, signed, *args, **kwargs)
     except (BinanceAPIException, BinanceRequestException, requests.RequestException) as e:
         if isinstance(e, BinanceAPIException) and e.code == -1021:
             sync_server_time()  # наступний запит піде з виправленим часом
-        raise
         _record_binance_api_error(e)
+        raise
 
 binance_client._request = _request_with_time_sync
-sync_server_time()
 
 STABLECOINS = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "DAIUSDT", "EURUSDT", "GBPUSDT", "BUSDUSDT"}
 
@@ -128,7 +157,7 @@ PERFORMANCE_TARGET_USDT = 30.0     # Ціль реалізованого при�
 PERFORMANCE_WINDOW_DAYS = 6        # Цільове вікно у днях
 MARKET_SNAPSHOT = {}               # Останні ринкові дані по символах
 KNOWN_USDT_SYMBOLS = set()
-SL_TP_POLL_SECONDS = 3          # Як часто перевіряти SL/TP між скануваннями
+SL_TP_POLL_SECONDS = 10         # Перевірка ручного SL/TP без зайвих запитів
 ADMIN_ACTIONS = queue.Queue()
 ADMIN_SNAPSHOT_LOCK = threading.Lock()
 ADMIN_SNAPSHOT_JSON = "{}"
@@ -382,6 +411,12 @@ def ensure_oco_safe(memory, symbol, force=False):
 
 def reconcile_oco_orders(memory, only_symbol=None):
     """Фіксує в пам'яті OCO, що виконалися на біржі (PnL, залишок позиції)."""
+    global _last_oco_reconcile
+    now = time.time()
+    if only_symbol is None:
+        if now - _last_oco_reconcile < OCO_RECONCILE_INTERVAL_SECONDS:
+            return False
+        _last_oco_reconcile = now
     changed = False
     for symbol, trade in list(memory.get("active_trades", {}).items()):
         if only_symbol and symbol != only_symbol:
@@ -551,8 +586,14 @@ def calculate_executed_fill_details(order):
 
 def get_top_usdt_symbols(limit=50):
     """Отримує ТОП-монети за об'ємом торгів"""
+    MARKET_TICKER_CACHE.clear()
     try:
         tickers = binance_client.get_ticker()
+        MARKET_TICKER_CACHE.update({
+            ticker["symbol"]: ticker
+            for ticker in tickers
+            if isinstance(ticker, dict) and "symbol" in ticker
+        })
         usdt_pairs = []
         for t in tickers:
             symbol = t['symbol']
@@ -625,7 +666,9 @@ def scan_market_watchlist(symbols):
     market_overview = []
     for symbol in symbols:
         try:
-            ticker = binance_client.get_ticker(symbol=symbol)
+            ticker = MARKET_TICKER_CACHE.get(symbol)
+            if ticker is None:
+                ticker = binance_client.get_ticker(symbol=symbol)
             klines = binance_client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=60)
             if len(klines) < 30:
                 continue
@@ -1879,6 +1922,11 @@ if __name__ == "__main__":
             set_current_memory(memory)
             process_admin_actions(memory)
             publish_admin_snapshot(memory)
+            if time.time() < BINANCE_COOLDOWN_UNTIL:
+                retry_in = max(1, int(BINANCE_COOLDOWN_UNTIL - time.time()))
+                print(f"⏸️ Binance заблокував IP; без нових API-запитів ще приблизно {retry_in} с.")
+                time.sleep(min(60, retry_in))
+                continue
             if process_emergency_stop(memory):
                 time.sleep(60)
                 continue
