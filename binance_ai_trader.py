@@ -1,10 +1,10 @@
 import json
 import math
 import os
+import queue
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from decimal import Decimal, ROUND_DOWN
 import anthropic
 import requests
@@ -105,8 +105,8 @@ def _request_with_time_sync(method, uri, signed, *args, **kwargs):
     except (BinanceAPIException, BinanceRequestException, requests.RequestException) as e:
         if isinstance(e, BinanceAPIException) and e.code == -1021:
             sync_server_time()  # наступний запит піде з виправленим часом
-        _record_binance_api_error(e)
         raise
+        _record_binance_api_error(e)
 
 binance_client._request = _request_with_time_sync
 sync_server_time()
@@ -129,6 +129,9 @@ PERFORMANCE_WINDOW_DAYS = 6        # Цільове вікно у днях
 MARKET_SNAPSHOT = {}               # Останні ринкові дані по символах
 KNOWN_USDT_SYMBOLS = set()
 SL_TP_POLL_SECONDS = 3          # Як часто перевіряти SL/TP між скануваннями
+ADMIN_ACTIONS = queue.Queue()
+ADMIN_SNAPSHOT_LOCK = threading.Lock()
+ADMIN_SNAPSHOT_JSON = "{}"
 
 # --- Менеджер пам'яті ---
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
@@ -1689,38 +1692,143 @@ DEFAULT_KEEP_ALIVE_URL = "https://binance-jcm1.onrender.com"
 KEEP_ALIVE_INTERVAL_SECONDS = 600
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def _respond(self, send_body):
-        body = b"OK"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if send_body:
-            self.wfile.write(body)
+def publish_admin_snapshot(memory=None, wallet=None, status=None):
+    global ADMIN_SNAPSHOT_JSON
+    memory = memory or CURRENT_MEMORY or {}
+    wallet = wallet or {}
+    snapshot = {
+        "status": status or (
+            "emergency stop" if memory.get("emergency_stop")
+            else "paused" if memory.get("admin_paused")
+            else "running"
+        ),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "wallet": {
+            "usdt_free_balance": wallet.get("usdt_free_balance", 0.0),
+            "holdings": wallet.get("holdings", []),
+            "error": wallet.get("error", False),
+        },
+        "active_trades": {
+            symbol: dict(trade)
+            for symbol, trade in memory.get("active_trades", {}).items()
+        },
+        "total_pnl_usdt": memory.get("total_pnl_usdt", 0.0),
+        "trade_history": memory.get("trade_history", [])[-30:],
+        "emergency_stop": dict(memory["emergency_stop"])
+        if memory.get("emergency_stop") else None,
+    }
+    with ADMIN_SNAPSHOT_LOCK:
+        ADMIN_SNAPSHOT_JSON = json.dumps(snapshot, ensure_ascii=False)
 
-    def do_GET(self):
-        self._respond(True)
 
-    def do_HEAD(self):
-        self._respond(False)
+def get_admin_snapshot():
+    with ADMIN_SNAPSHOT_LOCK:
+        return json.loads(ADMIN_SNAPSHOT_JSON)
 
-    def log_message(self, format, *args):
-        pass
+
+def submit_admin_action(action):
+    if action not in {"pause", "resume", "emergency_sell"}:
+        raise ValueError(f"Непідтримувана адміністративна команда: {action}")
+    ADMIN_ACTIONS.put(action)
+
+
+def process_admin_actions(memory):
+    changed = False
+    emergency_requested = False
+    while True:
+        try:
+            action = ADMIN_ACTIONS.get_nowait()
+        except queue.Empty:
+            break
+        if action == "pause":
+            memory["admin_paused"] = True
+            print("⏸️ Адміністратор призупинив нові угоди; супровід позицій триває.")
+        elif action == "resume":
+            if memory.get("emergency_stop"):
+                print("⛔ Аварійна зупинка активна; відновлення заблоковане до ручної перевірки.")
+            else:
+                memory["admin_paused"] = False
+                print("▶️ Адміністратор відновив роботу бота.")
+        elif action == "emergency_sell":
+            memory["emergency_stop"] = {
+                "status": "liquidating",
+                "reason": "Аварійний продаж запущений адміністратором",
+                "error_signature": "admin_requested",
+                "triggered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "error_count": 0,
+                "attempts": 0,
+            }
+            emergency_requested = True
+            print("🚨 Адміністратор запросив аварійну ліквідацію всіх монет.")
+        changed = True
+    if changed:
+        save_memory(memory)
+        publish_admin_snapshot(memory)
+    return emergency_requested
+
+
+def admin_advisor(message, history):
+    state = get_admin_snapshot()
+    context = {
+        "status": state["status"],
+        "wallet": state["wallet"],
+        "active_trades": state["active_trades"],
+        "total_pnl_usdt": state["total_pnl_usdt"],
+        "trade_history": state["trade_history"],
+        "emergency_stop": state["emergency_stop"],
+    }
+    messages = [{
+        "role": "user",
+        "content": (
+            "Поточний знімок стану бота (JSON):\n"
+            + json.dumps(context, ensure_ascii=False)
+            + "\nВикористовуй цей стан як актуальний контекст для подальшої розмови."
+        ),
+    }]
+    messages.extend(
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in history[-10:]
+        if turn.get("role") in {"user", "assistant"}
+    )
+    messages.append({"role": "user", "content": message})
+    response = client_anthropic.messages.create(
+        model=get_best_available_model(),
+        max_tokens=1200,
+        system=(
+            "Ти — аналітичний помічник адміністратора криптотрейдинг-бота. "
+            "Відповідай на запит і розглядай повідомлення адміністратора як ідеї для аналізу, "
+            "а не як команду до виконання. Ти не маєш доступу до інструментів і не можеш "
+            "виконувати, ініціювати чи обіцяти угоди, змінювати налаштування або стан бота. "
+            "Не проси API-ключі, паролі чи коди автентифікатора. Вказуй невизначеність і ризики."
+        ),
+        messages=messages,
+    )
+    return "\n".join(
+        block.text for block in response.content
+        if getattr(block, "type", None) == "text"
+    ).strip()
 
 
 def start_health_server():
-    # Render Web Service вимагає відкритий порт; пінг сюди не дає сервісу засинати
+    # Render Web Service вимагає відкритий порт; він також обслуговує адмін-панель.
     port_value = os.getenv("PORT")
     if not port_value:
         return
     try:
-        server = ThreadingHTTPServer(("0.0.0.0", int(port_value)), HealthHandler)
-    except (ValueError, OSError) as e:
-        print(f"⚠️ Не вдалося запустити health-сервер: {e}")
+        from admin_dashboard import create_admin_app
+        from waitress import serve
+
+        app = create_admin_app(get_admin_snapshot, submit_admin_action, admin_advisor)
+        port = int(port_value)
+        threading.Thread(
+            target=serve,
+            kwargs={"app": app, "host": "0.0.0.0", "port": port, "threads": 4},
+            daemon=True,
+        ).start()
+    except Exception as e:
+        print(f"⚠️ Не вдалося запустити вебсервер адміністратора: {e}")
         return
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"🌐 Health-сервер слухає порт {port_value}.")
+    print(f"🌐 Health та адмін-панель слухають порт {port_value}.")
 
 
 def keep_alive_loop(url):
@@ -1769,6 +1877,8 @@ if __name__ == "__main__":
                 else load_memory()
             )
             set_current_memory(memory)
+            process_admin_actions(memory)
+            publish_admin_snapshot(memory)
             if process_emergency_stop(memory):
                 time.sleep(60)
                 continue
@@ -1776,12 +1886,14 @@ if __name__ == "__main__":
             
             # 0. Фіксація OCO, що спрацювали на біржі
             reconcile_oco_orders(memory)
+            process_admin_actions(memory)
             if process_emergency_stop(memory):
                 time.sleep(60)
                 continue
 
             # 1. Опитувальна перевірка SL/TP для позицій без OCO
             check_auto_sl_tp(memory)
+            process_admin_actions(memory)
             if process_emergency_stop(memory):
                 time.sleep(60)
                 continue
@@ -1789,6 +1901,8 @@ if __name__ == "__main__":
             # 2. Свіжий баланс після можливих продажів і безпечна синхронізація
             wallet_info = get_account_balances_and_positions(memory["active_trades"])
             sync_memory_with_wallet(memory, wallet_info)
+            publish_admin_snapshot(memory, wallet_info)
+            process_admin_actions(memory)
             if process_emergency_stop(memory):
                 time.sleep(60)
                 continue
@@ -1811,25 +1925,36 @@ if __name__ == "__main__":
             goal = memory.get("performance_goal", {})
             if goal.get("status") == "paused" and not memory["active_trades"]:
                 print("⏸️ Цільове вікно закрите; позицій для супроводу немає. Бот переходить у режим очікування.")
-                time.sleep(3600)
+                for _ in range(20):
+                    time.sleep(SL_TP_POLL_SECONDS)
+                    process_admin_actions(memory)
+                    if process_emergency_stop(memory):
+                        break
+                    publish_admin_snapshot(memory)
                 continue
 
             if goal.get("status") != "paused":
-                watchlist = get_top_usdt_symbols(limit=TOP_MARKET_COINS_LIMIT)
-                market_data = scan_market_watchlist(watchlist)
-                if process_emergency_stop(memory):
-                    time.sleep(60)
-                    continue
-                
-                if market_data:
-                    trade_decision = ask_claude_to_select_and_trade(market_data, wallet_info, memory)
+                if memory.get("admin_paused"):
+                    print("⏸️ Адміністратор призупинив нові угоди; супровід позицій триває.")
+                else:
+                    watchlist = get_top_usdt_symbols(limit=TOP_MARKET_COINS_LIMIT)
+                    market_data = scan_market_watchlist(watchlist)
+                    process_admin_actions(memory)
                     if process_emergency_stop(memory):
                         time.sleep(60)
                         continue
-                    execute_trade_safely(trade_decision, memory)
-                    if process_emergency_stop(memory):
-                        time.sleep(60)
-                        continue
+
+                    if not memory.get("admin_paused") and market_data:
+                        trade_decision = ask_claude_to_select_and_trade(market_data, wallet_info, memory)
+                        process_admin_actions(memory)
+                        if process_emergency_stop(memory):
+                            time.sleep(60)
+                            continue
+                        if not memory.get("admin_paused"):
+                            execute_trade_safely(trade_decision, memory)
+                            if process_emergency_stop(memory):
+                                time.sleep(60)
+                                continue
             else:
                 print("⏸️ Новий аналіз і BUY призупинені; перевіряю лише наявні позиції.")
             
@@ -1840,8 +1965,10 @@ if __name__ == "__main__":
                 waited += SL_TP_POLL_SECONDS
                 reconcile_oco_orders(memory)
                 check_auto_sl_tp(memory)
+                process_admin_actions(memory)
                 if process_emergency_stop(memory):
                     break
+                publish_admin_snapshot(memory, wallet_info)
             
         except KeyboardInterrupt:
             print("\n🛑 Роботу бота зупинено користувачем.")

@@ -2,3 +2,6 @@ anthropic==1.15.0
 python-binance==1.0.37
 python-dotenv>=1.0,<2.0
 requests>=2.31
+Flask>=3.0,<4.0
+pyotp>=2.9,<3.0
+waitress>=3.0,<4.0
